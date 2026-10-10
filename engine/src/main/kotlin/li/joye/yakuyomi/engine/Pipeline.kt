@@ -42,6 +42,9 @@ data class PageStats(
     val wallMs: Long = 0,   // 實際牆鐘時間（去字‖翻譯重疊 ⇒ 通常 < totalMs；省下的＝重疊掉的）
     val promptTokens: Int = 0,      // 本頁 LLM 請求的 prompt token（無 LLM/代理不回＝0）。供統計：用量只記、不計價。
     val completionTokens: Int = 0,  // 本頁 LLM 請求的 completion token。
+    val skippedTopEdge: Boolean = false,    // 上緣有待接縫處理的字（跳過了貼邊區，或筆畫遮罩碰到上緣）
+    val skippedBottomEdge: Boolean = false, // 下緣同上
+    val skippedBoxes: List<FloatArray> = emptyList(), // 依 RegionScope 跳過的貼邊區 bbox（頁座標 x0,y0,x1,y1）
 ) {
     /** 各階段純計算時間之和（不含重疊修正）；實際耗時看 [wallMs]。 */
     val totalMs: Long get() = detectMs + ocrMs + translateMs + inpaintMs + renderMs
@@ -72,7 +75,9 @@ class Pipeline(
     private val typeface: Typeface? = null,
 ) : TranslationEngine {
 
-    override suspend fun translatePage(page: Bitmap): PageResult = coroutineScope {
+    override suspend fun translatePage(page: Bitmap): PageResult = translatePage(page, RegionScope.ALL)
+
+    override suspend fun translatePage(page: Bitmap, scope: RegionScope): PageResult = coroutineScope {
         val tWall = System.currentTimeMillis()
         EngineTrace.log("pipe.page.enter ${page.width}x${page.height}")
         // 偵測
@@ -100,10 +105,22 @@ class Pipeline(
         EngineTrace.log("pipe.ocr.exit")
         val regions = Grouping.mergeStacked(Grouping.group(lines))
         val ocrMs = System.currentTimeMillis() - tOcr
-        // 去字集＝有 OCR 原文的區（空白＝疑似誤偵測，不去字、保畫面）。此集翻譯前就確定 ⇒ 去字可與翻譯並發。
-        val textRegions = regions.filter { it.sourceText.isNotBlank() }
+        // 去字集＝有 OCR 原文、且在 [scope] 內的區（空白＝疑似誤偵測，不去字、保畫面）。此集翻譯前就確定 ⇒ 去字可與翻譯並發。
+        val nonBlank = regions.filter { it.sourceText.isNotBlank() }
+        val textRegions = nonBlank.filter { scope.keeps(it, page.height) }
+        // 跳過的貼邊區（含 OCR 讀不出的殘段）→ 交給接縫處理；筆畫遮罩碰到邊緣也算（被切掉的字殘段可能偵測不成行）
+        val skippedRegions = if (scope.skipTopEdge || scope.skipBottomEdge) regions.filter { !scope.keeps(it, page.height) } else emptyList()
+        val skippedTop = scope.skipTopEdge &&
+            (skippedRegions.any { it.y0 < page.height / 2 } || maskTouchesRow(detection.textMask, 0))
+        val skippedBottom = scope.skipBottomEdge &&
+            (skippedRegions.any { it.y1 >= page.height / 2 } || maskTouchesRow(detection.textMask, page.height - 1))
+        val skippedBoxes = skippedRegions.map { floatArrayOf(it.x0, it.y0, it.x1, it.y1) }
         if (textRegions.isEmpty()) {
-            return@coroutineScope PageResult.Skipped("OCR 全空", PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0))
+            val why = if (nonBlank.isEmpty()) "OCR 全空" else "只有貼邊／範圍外的文字區"
+            return@coroutineScope PageResult.Skipped(
+                why,
+                PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0, skippedTopEdge = skippedTop, skippedBottomEdge = skippedBottom, skippedBoxes = skippedBoxes),
+            )
         }
 
         // ★ 去字（CPU）‖ 翻譯（網路）並發：兩者只依賴 OCR，可同時跑（網路等待時 CPU 去字、互不爭資源）。
@@ -172,6 +189,7 @@ class Pipeline(
                     PageStats(
                         lines.size, regions.size, 0, detectMs, ocrMs, translateMs, 0, 0,
                         promptTokens = promptTok, completionTokens = completionTok,
+                        skippedTopEdge = skippedTop, skippedBottomEdge = skippedBottom, skippedBoxes = skippedBoxes,
                     ),
                 )
             }
@@ -205,6 +223,7 @@ class Pipeline(
             PageStats(
                 lines.size, regions.size, kept.size, detectMs, ocrMs, translateMs, inpaintMs, renderMs,
                 System.currentTimeMillis() - tWall, promptTok, completionTok,
+                skippedTopEdge = skippedTop, skippedBottomEdge = skippedBottom, skippedBoxes = skippedBoxes,
             ),
             PageAnalysis(detection.textMask, textRegions),
         )
@@ -228,6 +247,20 @@ class Pipeline(
             }
             cleaned.setPixels(cur, 0, bw, x0, y0, bw, bh)
         }
+    }
+
+    /** 筆畫遮罩在第 [y] 列（附近 3 列）有足夠的字（≥ 3 px）：被頁緣切掉的字殘段。 */
+    private fun maskTouchesRow(mask: Bitmap, y: Int): Boolean {
+        val w = mask.width
+        val row = IntArray(w)
+        var n = 0
+        for (dy in 0 until 3) {
+            val yy = if (y == 0) dy else y - dy
+            if (yy !in 0 until mask.height) continue
+            mask.getPixels(row, 0, w, 0, yy, w, 1)
+            for (p in row) if ((p and 0xFF) > 127) n++
+        }
+        return n >= 3
     }
 
     /**

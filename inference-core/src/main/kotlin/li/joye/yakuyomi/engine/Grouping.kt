@@ -149,7 +149,7 @@ object Grouping {
     /**
      * 分群後補一步（m-i-t 沒有、不影響 [group] 的 parity）：同一顆氣泡裡上下相疊、卻因字寬差太多被切成兩區的橫書行
      * （例：「세상에!」＋「뺨자국 난거 봐!!」）合回一區——否則兩段譯文各自排版會互相重疊，翻譯也拿不到完整句子。
-     * 條件：兩區都是無傾斜橫書、字高比 ≤ 1.6、垂直間距 ≤ 0.9 行高（可小幅重疊）、水平中心差 ≤ 較寬者一半。
+     * 條件：兩區都是無傾斜橫書、字高比 ≤ 1.6、垂直間距 ≤ 0.9 行高（字高相近且水平重疊過半時 ≤ 1.25；可小幅重疊）、水平中心差 ≤ 較寬者一半。
      */
     fun mergeStacked(regions: List<TextRegion>): List<TextRegion> {
         val rs = regions.toMutableList()
@@ -162,10 +162,15 @@ object Grouping {
                 if (a.direction != "h" || b.direction != "h" || a.angle != 0f || b.angle != 0f) continue
                 if ((a.y0 + a.y1) > (b.y0 + b.y1)) continue // a 在上
                 val lhA = a.lineHeight; val lhB = b.lineHeight
-                if (lhA <= 0f || lhB <= 0f || max(lhA, lhB) / min(lhA, lhB) > 1.6f) continue
+                if (lhA <= 0f || lhB <= 0f) continue
+                val ratio = max(lhA, lhB) / min(lhA, lhB)
+                if (ratio > 1.6f) continue
                 val lh = min(lhA, lhB)
                 val gap = b.y0 - a.y1
-                if (gap > 0.9f * lh || gap < -0.5f * lh) continue
+                // 行距：一般 ≤ 0.9 行高；字高相近（≤ 1.3 倍）且水平重疊夠多時放寬到 1.25 行高（旁白框常見的寬行距）
+                val overlap = min(a.x1, b.x1) - max(a.x0, b.x0)
+                val wide = ratio <= 1.3f && overlap >= 0.5f * min(a.x1 - a.x0, b.x1 - b.x0)
+                if (gap > (if (wide) 1.25f else 0.9f) * lh || gap < -0.5f * lh) continue
                 val acx = (a.x0 + a.x1) / 2f; val bcx = (b.x0 + b.x1) / 2f
                 if (abs(acx - bcx) > max(a.x1 - a.x0, b.x1 - b.x0) / 2f) continue
                 val lines = (a.lines + b.lines).sortedBy { ln -> ln.quad.sumOf { it.y.toDouble() } / ln.quad.size }

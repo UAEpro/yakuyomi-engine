@@ -68,6 +68,10 @@ class PageHarnessTest {
             .sortedBy { it.name }
         val summary = JSONArray()
         pipeline.use { p ->
+            if (System.getenv("YAKU_HARNESS_SEAMS") != null) {
+                seamRun(p, files, out)
+                return@use
+            }
             for (f in files) {
                 val page = BitmapFactory.decodeFile(f.path).copy(Bitmap.Config.ARGB_8888, false)
                 val t0 = System.currentTimeMillis()
@@ -106,6 +110,51 @@ class PageHarnessTest {
         }
         File(out, "summary.json").writeText(summary.toString(1))
         File(out, "pending.json").writeText(JSONObject(pending.associateWith { "" }).toString(1))
+    }
+
+    /**
+     * 模擬 app 的條漫流程（PageTranslator.translateChapter + translateSeams）：每頁跳過貼著相鄰頁那側的文字區，
+     * 再把每個接縫拼條只翻跨縫區、切回兩頁。輸出各頁 `<name>.seam.png` 與整條拼接 `strip.png`。
+     */
+    private fun seamRun(p: Pipeline, files: List<File>, out: File) {
+        val pages = files.map { BitmapFactory.decodeFile(it.path).copy(Bitmap.Config.ARGB_8888, true) }.toMutableList()
+        val flags = ArrayList<Pair<Boolean, Boolean>>()
+        val boxes = ArrayList<List<FloatArray>>()
+        for (i in pages.indices) {
+            val scope = RegionScope(skipTopEdge = i > 0, skipBottomEdge = i < pages.size - 1)
+            when (val r = runBlocking { p.translatePage(pages[i], scope) }) {
+                is PageResult.Translated -> { pages[i] = r.page; flags += r.stats.skippedTopEdge to r.stats.skippedBottomEdge; boxes += r.stats.skippedBoxes }
+                is PageResult.Skipped -> { flags += r.stats.skippedTopEdge to r.stats.skippedBottomEdge; boxes += r.stats.skippedBoxes }
+                is PageResult.Failed -> { flags += false to false; boxes += emptyList<FloatArray>() }
+            }
+            println("[harness] ${files[i].name} flags=${flags.last()}")
+        }
+        for (i in 0 until pages.size - 1) {
+            if (!flags[i].second && !flags[i + 1].first) continue
+            val a = pages[i]; val b = pages[i + 1]; val w = a.width
+            val h1 = minOf(a.height, (w * 1.2f).toInt()); val h2 = minOf(b.height, (w * 1.2f).toInt())
+            val band = Bitmap.createBitmap(w, h1 + h2, Bitmap.Config.ARGB_8888)
+            Canvas(band).apply {
+                drawBitmap(a, android.graphics.Rect(0, a.height - h1, w, a.height), android.graphics.Rect(0, 0, w, h1), null)
+                drawBitmap(b, android.graphics.Rect(0, 0, w, h2), android.graphics.Rect(0, h1, w, h1 + h2), null)
+            }
+            val keep = boxes[i].filter { it[3] > a.height - h1 }.map { floatArrayOf(it[0], it[1] - (a.height - h1), it[2], it[3] - (a.height - h1)) } +
+                boxes[i + 1].filter { it[1] < h2 }.map { floatArrayOf(it[0], it[1] + h1, it[2], it[3] + h1) }
+            val r = runBlocking { p.translatePage(band, RegionScope(onlyTouchingY = h1, keepBoxes = keep)) }
+            println("[harness] seam ${files[i].name}|${files[i + 1].name} -> ${r.javaClass.simpleName}")
+            if (r is PageResult.Translated) {
+                val oa = a.copy(Bitmap.Config.ARGB_8888, true); val ob = b.copy(Bitmap.Config.ARGB_8888, true)
+                Canvas(oa).drawBitmap(r.page, android.graphics.Rect(0, 0, w, h1), android.graphics.Rect(0, a.height - h1, w, a.height), null)
+                Canvas(ob).drawBitmap(r.page, android.graphics.Rect(0, h1, w, h1 + h2), android.graphics.Rect(0, 0, w, h2), null)
+                pages[i] = oa; pages[i + 1] = ob
+            }
+        }
+        files.forEachIndexed { i, f -> save(pages[i], File(out, "${f.nameWithoutExtension}.seam.png")) }
+        val total = pages.sumOf { it.height }
+        val strip = Bitmap.createBitmap(pages[0].width, total, Bitmap.Config.ARGB_8888)
+        var y = 0f
+        Canvas(strip).apply { for (pg in pages) { drawBitmap(pg, 0f, y, null); y += pg.height } }
+        save(strip, File(out, "strip.png"))
     }
 
     private fun debugOverlay(page: Bitmap, regions: List<TextRegion>): Bitmap {
