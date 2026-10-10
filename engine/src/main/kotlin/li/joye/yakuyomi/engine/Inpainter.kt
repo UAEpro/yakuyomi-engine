@@ -54,47 +54,199 @@ class Inpainter(
             return@coroutineScope result
         }
 
-        // aot（預設）：全區都跑 AOT-GAN 整頁重建；標 onArt 讓 Renderer 給黑字粗白邊。
-        regions.forEach { it.onArt = true }
+        // aot（預設）：
+        //  1. 背景近乎單色的區（乾淨白泡、色框、純色底，任何顏色）→ 只把文字行框（略外擴）平塗成背景眾數色：瞬間、無殘影、
+        //     不碰氣泡外框。onArt=false → Renderer 依背景亮度選黑／白字。
+        //  2. 其餘（壓在畫面上）→ AOT-GAN 重建；onArt=true → 黑字粗白邊。
+        //     一般頁整頁一次（縮到 tileSize）；長條頁（條漫）整頁縮會把字壓扁成橫紋 → 改在各區周圍取「短邊見方」視窗跑。
+        val px = IntArray(w * h); page.getPixels(px, 0, w, 0, 0, w, h)
+        val tightPx = IntArray(w * h); textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
+        val busy = ArrayList<TextRegion>()
+        val flat = ArrayList<Pair<TextRegion, Int>>()
+        for (r in regions) {
+            val s = bgStats(px, tightPx, r, w, h)
+            r.dbgStd = s.std; r.dbgWhite = s.meanLum
+            if (s.modeFrac >= FLAT_FRAC) {
+                r.onArt = false
+                fillLineQuads(result, r, s.modeColor)
+                flat += r to s.modeColor
+            } else {
+                r.onArt = true
+                busy += r
+            }
+        }
+        // 氣泡內部在「去字後」量：字已塗成背景色，內部是一整片單色（原圖上量會被漏網的筆畫切斷）。
+        if (flat.isNotEmpty()) {
+            val cleanPx = IntArray(w * h); result.getPixels(cleanPx, 0, w, 0, 0, w, h)
+            val holes = ArrayList<Int>()
+            for ((r, color) in flat) {
+                holes.clear()
+                r.layoutBoxes = bubbleInterior(cleanPx, r, color, w, h, holes)
+                for (i in holes) cleanPx[i] = color
+                if (holes.isNotEmpty()) result.setPixels(cleanPx, 0, w, 0, 0, w, h)
+            }
+        }
+        if (busy.isEmpty()) return@coroutineScope result
+        val busyMask = if (busy.size == regions.size) maskPx else buildSegMask(busy, textMask, w, h)
         val maskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        maskBmp.setPixels(maskPx, 0, w, 0, 0, w, h)
+        maskBmp.setPixels(busyMask, 0, w, 0, 0, w, h)
         if (maxOf(w, h) > TALL_RATIO * minOf(w, h)) {
-            // 長條（條漫／webtoon）：整頁壓成方形 tileSize 會把文字壓扁好幾倍 → AOT 重建出橫紋色帶。
-            // 改成：平底區直接平塗背景色；其餘區各自取「短邊見方」的視窗跑 AOT（比例不失真）。
-            inpaintTall(page, result, regions, maskPx, maskBmp, textMask, w, h)
+            inpaintWindows(page, result, busy, busyMask, maskBmp, w, h)
         } else {
-            runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+            runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, busyMask, it) }
         }
         maskBmp.recycle()
         result
     }
 
     /**
-     * 長條頁去字：
-     *  1. 區內背景近乎單色（眾數色佔背景 ≥ [FLAT_FRAC]，乾淨白泡／色框）→ 平塗眾數色（同 boxfill，瞬間且無殘影），onArt=false。
-     *  2. 其餘（壓畫面）→ 以區中心取「短邊×短邊」視窗（區比短邊大才放大視窗）跑 AOT，只把該區（bbox 外擴）內的遮罩像素貼回。
-     *     視窗彼此涵蓋的區合併成一次推論。
+     * 單色底區去字：把每個文字行框（四邊形，各邊外擴行高×[QUAD_GROW]＋2px）平塗成背景色。
+     * 只動行框內（DBNet 行框已含字的外緣），氣泡外框、黑環等不會被塗掉。
      */
-    private fun inpaintTall(
-        page: Bitmap, result: Bitmap, regions: List<TextRegion>, maskPx: IntArray, maskBmp: Bitmap,
-        textMask: Bitmap, w: Int, h: Int,
-    ) {
-        val px = IntArray(w * h); page.getPixels(px, 0, w, 0, 0, w, h)
-        val tightPx = IntArray(w * h); textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
-        val pad = cfg.bboxPad + (cfg.maskDilate / 2f).roundToInt() + 1
-        val busy = ArrayList<TextRegion>()
-        for (r in regions) {
-            val s = bgStats(px, tightPx, r, w, h)
-            r.dbgStd = s.std; r.dbgWhite = s.meanLum
-            if (s.modeFrac >= FLAT_FRAC) {
-                r.onArt = false
-                flatFill(result, maskPx, r, s.modeColor, pad, w, h)
-            } else {
-                busy += r
+    private fun fillLineQuads(result: Bitmap, region: TextRegion, color: Int) {
+        val c = Canvas(result)
+        val p = Paint().apply { this.color = color; style = Paint.Style.FILL; isAntiAlias = false }
+        for (line in region.lines) {
+            val q = line.quad
+            if (q.size < 4) continue
+            val cx = q.sumOf { it.x.toDouble() }.toFloat() / q.size
+            val cy = q.sumOf { it.y.toDouble() }.toFloat() / q.size
+            // 沿四邊形自身兩軸外擴（u＝q0→q1、v＝q1→q2），長條行的上下緣也確實外推
+            val ux = q[1].x - q[0].x; val uy = q[1].y - q[0].y
+            val vx = q[2].x - q[1].x; val vy = q[2].y - q[1].y
+            val ul = kotlin.math.hypot(ux.toDouble(), uy.toDouble()).toFloat().coerceAtLeast(1f)
+            val vl = kotlin.math.hypot(vx.toDouble(), vy.toDouble()).toFloat().coerceAtLeast(1f)
+            val grow = minOf(ul, vl) * QUAD_GROW + 2f
+            val path = android.graphics.Path()
+            q.forEachIndexed { i, pt ->
+                val dx = pt.x - cx; val dy = pt.y - cy
+                val su = if (dx * ux + dy * uy >= 0) 1f else -1f
+                val sv = if (dx * vx + dy * vy >= 0) 1f else -1f
+                val x = pt.x + grow * (su * ux / ul + sv * vx / vl)
+                val y = pt.y + grow * (su * uy / ul + sv * vy / vl)
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            path.close()
+            c.drawPath(path, p)
+        }
+    }
+
+    /**
+     * 量單色底區的「氣泡內部」並回傳幾個內接矩形候選（由扁到高）：
+     *  1. 從文字中心附近洪水填充「背景色」像素（[px] 是去字後的圖），範圍限在 bbox 外擴上限內（旁白落在整片白底時不會無限大）。
+     *  2. 以文字中心為軸，對不同半高 k 取「上下各 k 列都連通」的最寬對稱矩形。
+     */
+    private fun bubbleInterior(px: IntArray, r: TextRegion, bg: Int, w: Int, h: Int, holes: MutableList<Int>): List<FloatArray> {
+        val br = (bg shr 16) and 0xFF; val bgG = (bg shr 8) and 0xFF; val bb = bg and 0xFF
+        val lh = r.lineHeight.coerceAtLeast(8f)
+        val tx0 = r.x0.toInt().coerceIn(0, w - 1); val tx1 = r.x1.toInt().coerceIn(tx0 + 1, w)
+        val ty0 = r.y0.toInt().coerceIn(0, h - 1); val ty1 = r.y1.toInt().coerceIn(ty0 + 1, h)
+        val gx = ((tx1 - tx0) * 0.8f + lh * 3f).toInt(); val gy = ((ty1 - ty0) * 1.0f + lh * 3f).toInt()
+        val lx0 = (tx0 - gx).coerceAtLeast(0); val lx1 = (tx1 + gx).coerceAtMost(w)
+        val ly0 = (ty0 - gy).coerceAtLeast(0); val ly1 = (ty1 + gy).coerceAtMost(h)
+        val lw = lx1 - lx0; val lhh = ly1 - ly0
+        fun ok(x: Int, y: Int): Boolean {
+            val p = px[y * w + x]
+            return abs(((p shr 16) and 0xFF) - br) <= BUBBLE_TOL && abs(((p shr 8) and 0xFF) - bgG) <= BUBBLE_TOL &&
+                abs((p and 0xFF) - bb) <= BUBBLE_TOL
+        }
+        // 1. 洪水填充（區域內座標）
+        val inside = BooleanArray(lw * lhh)
+        val stack = IntArray(lw * lhh); var sp = 0
+        for (ln in r.lines) {
+            val sx = (ln.quad.sumOf { it.x.toDouble() } / ln.quad.size).toInt().coerceIn(lx0, lx1 - 1)
+            val sy = (ln.quad.sumOf { it.y.toDouble() } / ln.quad.size).toInt().coerceIn(ly0, ly1 - 1)
+            val li = (sy - ly0) * lw + (sx - lx0)
+            if (!inside[li] && ok(sx, sy)) { inside[li] = true; stack[sp++] = li }
+        }
+        while (sp > 0) {
+            val li = stack[--sp]; val x = li % lw; val y = li / lw
+            if (x > 0) { val n = li - 1; if (!inside[n] && ok(lx0 + x - 1, ly0 + y)) { inside[n] = true; stack[sp++] = n } }
+            if (x < lw - 1) { val n = li + 1; if (!inside[n] && ok(lx0 + x + 1, ly0 + y)) { inside[n] = true; stack[sp++] = n } }
+            if (y > 0) { val n = li - lw; if (!inside[n] && ok(lx0 + x, ly0 + y - 1)) { inside[n] = true; stack[sp++] = n } }
+            if (y < lhh - 1) { val n = li + lw; if (!inside[n] && ok(lx0 + x, ly0 + y + 1)) { inside[n] = true; stack[sp++] = n } }
+        }
+        // 1b. 補洞：完全被內部包圍、靠近文字、面積小的非背景塊（行框沒蓋到的「……」、字的殘渣）→ 記進 holes 由呼叫端塗成背景。
+        //     與外界相連的（氣泡外框、外面的畫）從限制框邊緣洪水填充得到，一律不動。
+        // 只在「封閉」的氣泡內補洞：內部碰到限制框邊緣＝開放底（旁白在整片白頁、或漏出氣泡），那時被包圍的可能是別的氣泡外框。
+        var closed = true
+        for (x in 0 until lw) if (inside[x] || inside[(lhh - 1) * lw + x]) { closed = false; break }
+        if (closed) for (y in 0 until lhh) if (inside[y * lw] || inside[y * lw + lw - 1]) { closed = false; break }
+        val outside = BooleanArray(lw * lhh)
+        sp = 0
+        fun pushOut(li: Int) { if (!inside[li] && !outside[li]) { outside[li] = true; stack[sp++] = li } }
+        for (x in 0 until lw) { pushOut(x); pushOut((lhh - 1) * lw + x) }
+        for (y in 0 until lhh) { pushOut(y * lw); pushOut(y * lw + lw - 1) }
+        while (sp > 0) {
+            val li = stack[--sp]; val x = li % lw; val y = li / lw
+            if (x > 0) pushOut(li - 1)
+            if (x < lw - 1) pushOut(li + 1)
+            if (y > 0) pushOut(li - lw)
+            if (y < lhh - 1) pushOut(li + lw)
+        }
+        val seen = BooleanArray(lw * lhh)
+        val maxHole = (lh * lh * 2f).toInt()
+        val nx0 = (tx0 - lh * 1.5f).toInt(); val nx1 = (tx1 + lh * 1.5f).toInt()
+        val ny0 = (ty0 - lh * 1.5f).toInt(); val ny1 = (ty1 + lh * 1.5f).toInt()
+        val comp = ArrayList<Int>()
+        for (start in 0 until lw * lhh) {
+            if (!closed) break
+            if (inside[start] || outside[start] || seen[start]) continue
+            comp.clear(); seen[start] = true; stack[0] = start; sp = 1
+            var near = true
+            var cx0 = lw; var cx1 = 0; var cy0 = lhh; var cy1 = 0
+            while (sp > 0) {
+                val li = stack[--sp]; comp += li
+                val x = li % lw; val y = li / lw
+                cx0 = minOf(cx0, x); cx1 = maxOf(cx1, x); cy0 = minOf(cy0, y); cy1 = maxOf(cy1, y)
+                val gx = lx0 + x; val gy = ly0 + y
+                if (gx < nx0 || gx >= nx1 || gy < ny0 || gy >= ny1) near = false
+                for (n in intArrayOf(if (x > 0) li - 1 else -1, if (x < lw - 1) li + 1 else -1, if (y > 0) li - lw else -1, if (y < lhh - 1) li + lw else -1)) {
+                    if (n >= 0 && !inside[n] && !outside[n] && !seen[n]) { seen[n] = true; stack[sp++] = n }
+                }
+            }
+            // 小塊（長寬都 ≤ 一行字高）：點點、殘渣；外框、圖案等大塊不動
+            if (near && comp.size <= maxHole && cx1 - cx0 < lh && cy1 - cy0 < lh) {
+                for (li in comp) { holes += (ly0 + li / lw) * w + lx0 + li % lw; inside[li] = true }
             }
         }
-        if (busy.isEmpty()) return
+        // 2. 以文字中心 (cx, cy) 為軸，每列向左右延伸到第一個非內部像素
+        val cx = ((tx0 + tx1) / 2 - lx0).coerceIn(0, lw - 1)
+        val cy = ((ty0 + ty1) / 2 - ly0).coerceIn(0, lhh - 1)
+        val left = IntArray(lhh) { -1 }; val right = IntArray(lhh) { -1 }
+        for (y in 0 until lhh) {
+            if (!inside[y * lw + cx]) continue
+            var a = cx; while (a > 0 && inside[y * lw + a - 1]) a--
+            var b = cx; while (b < lw - 1 && inside[y * lw + b + 1]) b++
+            left[y] = a; right[y] = b + 1
+        }
+        val out = ArrayList<FloatArray>()
+        var l = 0; var rr = lw
+        var k = 0
+        val minK = (lh * 0.5f).toInt().coerceAtLeast(3)   // 最矮候選＝約一行高（扁寬框放短句）
+        val step = (lh / 6f).toInt().coerceAtLeast(2)
+        while (cy - k >= 0 && cy + k < lhh && left[cy - k] >= 0 && left[cy + k] >= 0) {
+            l = maxOf(l, left[cy - k], left[cy + k]); rr = minOf(rr, right[cy - k], right[cy + k])
+            if (rr - l < lh) break
+            // 不必對稱於文字中心（框可偏向氣泡較寬的一側），但中心離原文中心不超過 [off]——開放白底的旁白才不會漂走
+            if (k >= minK && (k - minK) % step == 0) {
+                var a = l; var b = rr
+                val off = (tx1 - tx0) * 0.15f + lh
+                val mid = (a + b) / 2f
+                if (mid > cx + off) b = (2 * (cx + off) - a).toInt() else if (mid < cx - off) a = (2 * (cx - off) - b).toInt()
+                if (b - a >= lh) out += floatArrayOf((lx0 + a).toFloat(), (ly0 + cy - k).toFloat(), (lx0 + b).toFloat(), (ly0 + cy + k + 1).toFloat())
+            }
+            k++
+        }
+        if (out.isEmpty()) out += floatArrayOf(r.x0, r.y0, r.x1, r.y1)
+        return out
+    }
 
+    /** 長條頁的 AOT：各區周圍取「短邊×短邊」視窗（區比短邊大才放大）跑 AOT，只把該區（bbox 外擴）內的遮罩像素貼回；同視窗涵蓋的區合併推論。 */
+    private fun inpaintWindows(
+        page: Bitmap, result: Bitmap, busy: List<TextRegion>, maskPx: IntArray, maskBmp: Bitmap, w: Int, h: Int,
+    ) {
+        val pad = cfg.bboxPad + (cfg.maskDilate / 2f).roundToInt() + 1
         val side = minOf(w, h)
         class Win(val x0: Int, val y0: Int, val ww: Int, val wh: Int, val members: MutableList<TextRegion> = ArrayList())
         val wins = ArrayList<Win>()
@@ -265,7 +417,8 @@ class Inpainter(
         var best = 0
         for (i in bins.indices) if (bins[i] > bins[best]) best = i
         val br = ((best shr 10) and 31) * 8 + 4; val bg = ((best shr 5) and 31) * 8 + 4; val bb = (best and 31) * 8 + 4
-        var near = 0; var mr = 0L; var mg = 0L; var mb = 0L
+        var near = 0
+        val exact = HashMap<Int, Int>()
         for (y in 0 until bh) for (x in 0 until bw) {
             if ((qm[y * bw + x] and 0xFF) <= 127) continue
             val gi = (y0 + y) * w + (x0 + x)
@@ -273,10 +426,11 @@ class Inpainter(
             val p = px[gi]
             val r = (p shr 16) and 0xFF; val g = (p shr 8) and 0xFF; val b = p and 0xFF
             if (abs(r - br) <= MODE_TOL && abs(g - bg) <= MODE_TOL && abs(b - bb) <= MODE_TOL) {
-                near++; mr += r; mg += g; mb += b
+                near++; exact.merge(p or (0xFF shl 24), 1, Int::plus)
             }
         }
-        val modeColor = if (near > 0) Color.rgb((mr / near).toInt(), (mg / near).toInt(), (mb / near).toInt()) else Color.rgb(br, bg, bb)
+        // 平塗色＝眾數色箱內「最常出現的精確色」（平均會被字緣抗鋸齒拉灰，填出來看得到一塊色差）
+        val modeColor = exact.maxByOrNull { it.value }?.key ?: Color.rgb(br, bg, bb)
         return BgStat(
             mean.toFloat(), std.toFloat(), Color.rgb((sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt()),
             modeColor, near.toFloat() / n,
@@ -387,10 +541,14 @@ class Inpainter(
 
     companion object {
         private const val TAG = "Inpainter"
-        /** 長邊 > 短邊×此值 視為長條頁（條漫），改走視窗去字（見 [inpaintTall]）。一般單頁約 1.4、跨頁約 1/1.4。 */
+        /** 長邊 > 短邊×此值 視為長條頁（條漫），壓畫面區改走視窗去字（見 [inpaintWindows]）。一般單頁約 1.4、跨頁約 1/1.4。 */
         private const val TALL_RATIO = 1.8f
+        /** 單色底平塗時行框外擴＝行高×此值（＋2px）。 */
+        private const val QUAD_GROW = 0.12f
         /** 區背景有此比例以上的像素落在眾數色 ±[MODE_TOL] 內 → 視為單色底（乾淨白泡／色框），平塗即可、不跑 AOT。 */
         private const val FLAT_FRAC = 0.85f
         private const val MODE_TOL = 16
+        /** 量氣泡內部時「背景色」的容差（JPEG 雜訊）。 */
+        private const val BUBBLE_TOL = 22
     }
 }

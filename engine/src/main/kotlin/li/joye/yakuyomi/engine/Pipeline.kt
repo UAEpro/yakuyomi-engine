@@ -98,7 +98,7 @@ class Pipeline(
             Log.e(TAG, "OCR 失敗", t); return@coroutineScope PageResult.Failed("ocr: ${t.message}")
         }
         EngineTrace.log("pipe.ocr.exit")
-        val regions = Grouping.group(lines)
+        val regions = Grouping.mergeStacked(Grouping.group(lines))
         val ocrMs = System.currentTimeMillis() - tOcr
         // 去字集＝有 OCR 原文的區（空白＝疑似誤偵測，不去字、保畫面）。此集翻譯前就確定 ⇒ 去字可與翻譯並發。
         val textRegions = regions.filter { it.sourceText.isNotBlank() }
@@ -188,10 +188,15 @@ class Pipeline(
             Log.e(TAG, "去字失敗", t); return@coroutineScope PageResult.Failed("inpaint: ${t.message}")
         }
 
-        // 排版（全 textRegions：kept 貼譯文、失敗區貼原文）
+        // 沒譯成的區（狀聲詞、OCR 雜訊、LLM 回空／原樣）→ 把去字範圍還原成原圖、不重貼 OCR 原文
+        // （重貼的是 OCR 讀錯的字＋預設字型，比原圖更糟；還原＝永不比原圖更糟）。去字已與翻譯並發，這裡只回貼像素。
+        val failed = textRegions.filter { it !in keptSet }
+        if (failed.isNotEmpty()) restoreOriginal(page, cleaned, failed, kept)
+
+        // 排版（只排有譯文的區）
         val tRn = System.currentTimeMillis()
         EngineTrace.log("pipe.render.enter")
-        val finalPage = Renderer.render(cleaned, textRegions, cfg.render, typeface)
+        val finalPage = Renderer.render(cleaned, kept, cfg.render, typeface)
         val renderMs = System.currentTimeMillis() - tRn
         EngineTrace.log("pipe.page.done")
 
@@ -203,6 +208,26 @@ class Pipeline(
             ),
             PageAnalysis(detection.textMask, textRegions),
         )
+    }
+
+    /** 把 [failed] 各區的去字範圍（bbox 外擴去字餘裕）還原成原圖像素；與有譯文的區重疊處不動。 */
+    private fun restoreOriginal(page: Bitmap, cleaned: Bitmap, failed: List<TextRegion>, kept: List<TextRegion>) {
+        val w = page.width; val h = page.height
+        val pad = cfg.inpainter.bboxPad + (cfg.inpainter.maskDilate / 2f).toInt() + 2
+        for (r in failed) {
+            val x0 = (r.x0.toInt() - pad).coerceIn(0, w - 1); val y0 = (r.y0.toInt() - pad).coerceIn(0, h - 1)
+            val x1 = (r.x1.toInt() + pad).coerceIn(x0 + 1, w); val y1 = (r.y1.toInt() + pad).coerceIn(y0 + 1, h)
+            val bw = x1 - x0; val bh = y1 - y0
+            val orig = IntArray(bw * bh); page.getPixels(orig, 0, bw, x0, y0, bw, bh)
+            val cur = IntArray(bw * bh); cleaned.getPixels(cur, 0, bw, x0, y0, bw, bh)
+            for (y in 0 until bh) for (x in 0 until bw) {
+                val gx = (x0 + x).toFloat(); val gy = (y0 + y).toFloat()
+                if (kept.none { gx >= it.x0 - pad && gx < it.x1 + pad && gy >= it.y0 - pad && gy < it.y1 + pad }) {
+                    cur[y * bw + x] = orig[y * bw + x]
+                }
+            }
+            cleaned.setPixels(cur, 0, bw, x0, y0, bw, bh)
+        }
     }
 
     /**
