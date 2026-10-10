@@ -222,8 +222,15 @@ object Renderer {
         val lh = size * 1.18f
         val tcx = (x0 + x1) / 2f
         var baseline = (y0 + y1) / 2f - lines.size * lh / 2f + size * ASCENT  // 垂直置中於框
+        val pageW = canvas.width.toFloat()
         for (ln in lines) {
-            val tx = tcx - fill.measureText(ln) / 2f
+            val lw = fill.measureText(ln)
+            // 置中後若超出頁緣（框貼頁邊、放大後的框比頁寬多）→ 推回頁內，避免句首／句尾被裁掉。
+            val tx = if (lw + 2 * EDGE_MARGIN <= pageW) {
+                (tcx - lw / 2f).coerceIn(EDGE_MARGIN, pageW - lw - EDGE_MARGIN)
+            } else {
+                tcx - lw / 2f
+            }
             if (cfg.fontBorder) canvas.drawText(ln, tx, baseline, stroke)
             canvas.drawText(ln, tx, baseline, fill)
             baseline += lh
@@ -243,6 +250,8 @@ object Renderer {
     }
 
     private fun wrapCjk(text: String, paint: Paint, maxW: Float): List<String> {
+        // 有空白分詞的非中日文（阿拉伯文、拉丁字母…）按詞換行：逐字切會把詞拆兩半（阿拉伯文連寫字形也會斷開）。
+        if (!isCjk(text) && text.contains(' ')) return wrapWords(text, paint, maxW)
         val lines = ArrayList<String>()
         val cur = StringBuilder()
         for (ch in text) {
@@ -256,7 +265,32 @@ object Renderer {
         return lines
     }
 
+    /** 按空白分詞換行；單一個詞比行寬還長才退回逐字切。 */
+    private fun wrapWords(text: String, paint: Paint, maxW: Float): List<String> {
+        val lines = ArrayList<String>()
+        for (para in text.split('\n')) {
+            var cur = ""
+            for (word in para.split(' ').filter { it.isNotEmpty() }) {
+                val cand = if (cur.isEmpty()) word else "$cur $word"
+                if (paint.measureText(cand) <= maxW) { cur = cand; continue }
+                if (cur.isNotEmpty()) lines.add(cur)
+                if (paint.measureText(word) <= maxW) { cur = word; continue }
+                val chunk = StringBuilder()
+                for (ch in word) {
+                    if (chunk.isNotEmpty() && paint.measureText(chunk.toString() + ch) > maxW) {
+                        lines.add(chunk.toString()); chunk.clear()
+                    }
+                    chunk.append(ch)
+                }
+                cur = chunk.toString()
+            }
+            lines.add(cur)
+        }
+        return lines.filter { it.isNotEmpty() }.ifEmpty { listOf("") }
+    }
+
     private const val ASCENT = 0.82f
+    private const val EDGE_MARGIN = 4f  // 橫排行與頁緣的最小距離（px）
     private const val STROKE_RATIO = 0.10f  // 描邊寬＝字級×此比例（隨字級縮放）
     private const val MAX_TCY = 4  // 縱中橫一格最多併幾個 ASCII（涵蓋 2 位數年齡、4 位數年份；更長退回逐字避免壓太扁）
     private const val ROTATE_CHARS = "ー－—―‐~〜～…‥（）()「」『』【】〔〕［］｛｝〈〉《》＜＞<>｜|：;"

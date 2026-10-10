@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.util.Log
+import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlinx.coroutines.coroutineScope
 
@@ -57,9 +58,81 @@ class Inpainter(
         regions.forEach { it.onArt = true }
         val maskBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         maskBmp.setPixels(maskPx, 0, w, 0, 0, w, h)
-        runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+        if (maxOf(w, h) > TALL_RATIO * minOf(w, h)) {
+            // 長條（條漫／webtoon）：整頁壓成方形 tileSize 會把文字壓扁好幾倍 → AOT 重建出橫紋色帶。
+            // 改成：平底區直接平塗背景色；其餘區各自取「短邊見方」的視窗跑 AOT（比例不失真）。
+            inpaintTall(page, result, regions, maskPx, maskBmp, textMask, w, h)
+        } else {
+            runWholeAot(page, maskBmp, w, h)?.let { compositePixels(result, maskPx, it) }
+        }
         maskBmp.recycle()
         result
+    }
+
+    /**
+     * 長條頁去字：
+     *  1. 區內背景近乎單色（眾數色佔背景 ≥ [FLAT_FRAC]，乾淨白泡／色框）→ 平塗眾數色（同 boxfill，瞬間且無殘影），onArt=false。
+     *  2. 其餘（壓畫面）→ 以區中心取「短邊×短邊」視窗（區比短邊大才放大視窗）跑 AOT，只把該區（bbox 外擴）內的遮罩像素貼回。
+     *     視窗彼此涵蓋的區合併成一次推論。
+     */
+    private fun inpaintTall(
+        page: Bitmap, result: Bitmap, regions: List<TextRegion>, maskPx: IntArray, maskBmp: Bitmap,
+        textMask: Bitmap, w: Int, h: Int,
+    ) {
+        val px = IntArray(w * h); page.getPixels(px, 0, w, 0, 0, w, h)
+        val tightPx = IntArray(w * h); textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
+        val pad = cfg.bboxPad + (cfg.maskDilate / 2f).roundToInt() + 1
+        val busy = ArrayList<TextRegion>()
+        for (r in regions) {
+            val s = bgStats(px, tightPx, r, w, h)
+            r.dbgStd = s.std; r.dbgWhite = s.meanLum
+            if (s.modeFrac >= FLAT_FRAC) {
+                r.onArt = false
+                flatFill(result, maskPx, r, s.modeColor, pad, w, h)
+            } else {
+                busy += r
+            }
+        }
+        if (busy.isEmpty()) return
+
+        val side = minOf(w, h)
+        class Win(val x0: Int, val y0: Int, val ww: Int, val wh: Int, val members: MutableList<TextRegion> = ArrayList())
+        val wins = ArrayList<Win>()
+        for (r in busy.sortedBy { it.y0 }) {
+            val rx0 = (r.x0.toInt() - pad).coerceAtLeast(0); val ry0 = (r.y0.toInt() - pad).coerceAtLeast(0)
+            val rx1 = (r.x1.toInt() + pad).coerceAtMost(w); val ry1 = (r.y1.toInt() + pad).coerceAtMost(h)
+            val host = wins.firstOrNull { rx0 >= it.x0 && ry0 >= it.y0 && rx1 <= it.x0 + it.ww && ry1 <= it.y0 + it.wh }
+            if (host != null) { host.members += r; continue }
+            val ww = maxOf(side, rx1 - rx0 + 2 * pad).coerceAtMost(w)
+            val wh = maxOf(side, ry1 - ry0 + 2 * pad).coerceAtMost(h)
+            val cx = (rx0 + rx1) / 2; val cy = (ry0 + ry1) / 2
+            val x0 = (cx - ww / 2).coerceIn(0, w - ww); val y0 = (cy - wh / 2).coerceIn(0, h - wh)
+            wins += Win(x0, y0, ww, wh).also { it.members += r }
+        }
+        for (win in wins) {
+            val cropPage = Bitmap.createBitmap(page, win.x0, win.y0, win.ww, win.wh)
+            val cropMask = Bitmap.createBitmap(maskBmp, win.x0, win.y0, win.ww, win.wh)
+            try {
+                val o = runWholeAot(cropPage, cropMask, win.ww, win.wh) ?: continue
+                val cur = IntArray(win.ww * win.wh)
+                result.getPixels(cur, 0, win.ww, win.x0, win.y0, win.ww, win.wh)
+                for (r in win.members) {
+                    val ax0 = ((r.x0.toInt() - pad) - win.x0).coerceIn(0, win.ww)
+                    val ay0 = ((r.y0.toInt() - pad) - win.y0).coerceIn(0, win.wh)
+                    val ax1 = ((r.x1.toInt() + pad) - win.x0).coerceIn(0, win.ww)
+                    val ay1 = ((r.y1.toInt() + pad) - win.y0).coerceIn(0, win.wh)
+                    for (y in ay0 until ay1) {
+                        val mrow = (win.y0 + y) * w + win.x0
+                        val row = y * win.ww
+                        for (x in ax0 until ax1) if ((maskPx[mrow + x] and 0xFF) > 127) cur[row + x] = o.px[row + x]
+                    }
+                }
+                result.setPixels(cur, 0, win.ww, win.x0, win.y0, win.ww, win.wh)
+            } finally {
+                if (cropPage !== page) cropPage.recycle()
+                if (cropMask !== maskBmp) cropMask.recycle()
+            }
+        }
     }
 
     /**
@@ -134,7 +207,8 @@ class Inpainter(
         }
     }
 
-    private class BgStat(val meanLum: Float, val std: Float, val color: Int)
+    /** [modeColor]／[modeFrac]：背景最常見的顏色（5-bit 量化分箱的平均）與落在該色 ±[MODE_TOL] 內的背景像素比例。 */
+    private class BgStat(val meanLum: Float, val std: Float, val color: Int, val modeColor: Int = color, val modeFrac: Float = 1f)
 
     /**
      * 區 bbox 內「非文字(背景)」像素的亮度均值+std+平均色。tightPx＝未膨脹 textMask（量得到筆畫間的白）。
@@ -179,7 +253,34 @@ class Inpainter(
         if (n < 16) return BgStat(255f, 0f, Color.WHITE)
         val mean = sl / n
         val std = kotlin.math.sqrt((sl2 / n - mean * mean).coerceAtLeast(0.0))
-        return BgStat(mean.toFloat(), std.toFloat(), Color.rgb((sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt()))
+        // 眾數色：抗鋸齒字緣（不在 tight 遮罩內）會把均值拉灰；平塗改用最常見的顏色，並量它佔背景的比例判斷是否單色底。
+        val bins = IntArray(32 * 32 * 32)
+        for (y in 0 until bh) for (x in 0 until bw) {
+            if ((qm[y * bw + x] and 0xFF) <= 127) continue
+            val gi = (y0 + y) * w + (x0 + x)
+            if ((tightPx[gi] and 0xFF) > 127) continue
+            val p = px[gi]
+            bins[(((p shr 19) and 31) shl 10) or (((p shr 11) and 31) shl 5) or ((p shr 3) and 31)]++
+        }
+        var best = 0
+        for (i in bins.indices) if (bins[i] > bins[best]) best = i
+        val br = ((best shr 10) and 31) * 8 + 4; val bg = ((best shr 5) and 31) * 8 + 4; val bb = (best and 31) * 8 + 4
+        var near = 0; var mr = 0L; var mg = 0L; var mb = 0L
+        for (y in 0 until bh) for (x in 0 until bw) {
+            if ((qm[y * bw + x] and 0xFF) <= 127) continue
+            val gi = (y0 + y) * w + (x0 + x)
+            if ((tightPx[gi] and 0xFF) > 127) continue
+            val p = px[gi]
+            val r = (p shr 16) and 0xFF; val g = (p shr 8) and 0xFF; val b = p and 0xFF
+            if (abs(r - br) <= MODE_TOL && abs(g - bg) <= MODE_TOL && abs(b - bb) <= MODE_TOL) {
+                near++; mr += r; mg += g; mb += b
+            }
+        }
+        val modeColor = if (near > 0) Color.rgb((mr / near).toInt(), (mg / near).toInt(), (mb / near).toInt()) else Color.rgb(br, bg, bb)
+        return BgStat(
+            mean.toFloat(), std.toFloat(), Color.rgb((sr / n).toInt(), (sg / n).toInt(), (sb / n).toInt()),
+            modeColor, near.toFloat() / n,
+        )
     }
 
     /** 白泡去字＝把區域 bbox(外擴 pad)內的去字遮罩像素直接平塗成背景色。均勻白泡保證無殘留。 */
@@ -286,5 +387,10 @@ class Inpainter(
 
     companion object {
         private const val TAG = "Inpainter"
+        /** 長邊 > 短邊×此值 視為長條頁（條漫），改走視窗去字（見 [inpaintTall]）。一般單頁約 1.4、跨頁約 1/1.4。 */
+        private const val TALL_RATIO = 1.8f
+        /** 區背景有此比例以上的像素落在眾數色 ±[MODE_TOL] 內 → 視為單色底（乾淨白泡／色框），平塗即可、不跑 AOT。 */
+        private const val FLAT_FRAC = 0.85f
+        private const val MODE_TOL = 16
     }
 }

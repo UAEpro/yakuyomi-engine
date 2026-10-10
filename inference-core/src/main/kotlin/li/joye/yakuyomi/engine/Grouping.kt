@@ -45,13 +45,43 @@ class TextRegion(
     var dbgStd: Float = -1f
     var dbgWhite: Float = -1f
 
-    /** 合併原文（lines 已依閱讀序排好）。日文無空白，直接相接。 */
-    val sourceText: String get() = lines.joinToString("") { it.text }
+    /** 合併原文（lines 已依閱讀序排好）。日文無空白直接相接；英文等以空白分詞的行間補空白（行尾連字號接回單字）。 */
+    val sourceText: String get() = joinLines(lines.map { it.text })
 
     val x0: Float = lines.minOf { ln -> ln.quad.minOf { it.x } }
     val y0: Float = lines.minOf { ln -> ln.quad.minOf { it.y } }
     val x1: Float = lines.maxOf { ln -> ln.quad.maxOf { it.x } }
     val y1: Float = lines.maxOf { ln -> ln.quad.maxOf { it.y } }
+}
+
+/**
+ * 依閱讀序合併各行文字。任一邊是中日文字（或全形標點）→ 直接相接；否則（英文等）補一個空白，
+ * 但上一行以連字號結尾、下一行以字母開頭時視為斷字，去掉連字號直接相接（"DIF-" + "FERENT" → "DIFFERENT"）。
+ */
+fun joinLines(texts: List<String>): String {
+    val sb = StringBuilder()
+    for (raw in texts) {
+        val t = raw.trim()
+        if (t.isEmpty()) continue
+        if (sb.isEmpty()) { sb.append(t); continue }
+        val prev = sb[sb.length - 1]
+        val next = t[0]
+        when {
+            isCjkChar(prev) || isCjkChar(next) -> sb.append(t)
+            prev == '-' && next.isLetter() && sb.length >= 2 && sb[sb.length - 2].isLetter() -> {
+                sb.setLength(sb.length - 1); sb.append(t)
+            }
+            else -> sb.append(' ').append(t)
+        }
+    }
+    return sb.toString()
+}
+
+/** 中日文字與全形標點（行間不需空白；韓文有分詞空白，不算）。 */
+private fun isCjkChar(c: Char): Boolean {
+    val o = c.code
+    return o in 0x3000..0x30FF || o in 0x3400..0x4DBF || o in 0x4E00..0x9FFF ||
+        o in 0xF900..0xFAFF || o in 0xFF00..0xFFEF
 }
 
 object Grouping {
