@@ -46,10 +46,28 @@ class Inpainter(
             // 逐區平塗背景色：白泡乾淨無殘留、忙碌區是平色塊（要品質用 aot）。
             val px = IntArray(w * h); result.getPixels(px, 0, w, 0, 0, w, h)
             val tightPx = IntArray(w * h); textMask.getPixels(tightPx, 0, w, 0, 0, w, h)
+            // 單色／漸層底（任何顏色）同 aot 路徑：行框＋光暈塗背景模型、量氣泡內部供排版；其餘才平塗平均色。
+            val flatModels = ArrayList<Pair<TextRegion, BgModel>>()
             for (r in regions) {
                 val s = bgStats(px, tightPx, r, w, h)
                 r.onArt = false; r.dbgStd = s.std; r.dbgWhite = s.meanLum // dbg 值給 sandbox 去背比較標框
-                flatFill(result, maskPx, r, s.color, cfg.bboxPad, w, h)
+                val model = chooseModel(s, fitPlane(px, tightPx, r, w, h), r)
+                if (model != null) {
+                    fillSmooth(page, result, px, tightPx, r, model, w, h)
+                    flatModels += r to model
+                } else {
+                    flatFill(result, maskPx, r, s.color, cfg.bboxPad, w, h)
+                }
+            }
+            if (flatModels.isNotEmpty()) {
+                val cleanPx = IntArray(w * h); result.getPixels(cleanPx, 0, w, 0, 0, w, h)
+                val holes = ArrayList<Int>()
+                for ((r, model) in flatModels) {
+                    holes.clear()
+                    r.layoutBoxes = bubbleInterior(cleanPx, r, model, w, h, holes)
+                    for (i in holes) cleanPx[i] = model.at(i % w, i / w)
+                    if (holes.isNotEmpty()) result.setPixels(cleanPx, 0, w, 0, 0, w, h)
+                }
             }
             return@coroutineScope result
         }
